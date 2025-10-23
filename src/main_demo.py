@@ -45,29 +45,47 @@ def _parse_genre_list_column(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def load_df_from_path(path: str) -> pd.DataFrame:
-    ext = os.path.splitext(path)[1].lower()
+    """
+    Load DataFrame from path. If path is relative, resolve it relative to src/ directory.
+    """
+    p = Path(path)
+    if not p.is_absolute():
+        # Resolve relative to src/ directory
+        src_dir = Path(__file__).resolve().parent
+        p = (src_dir / path).resolve()
+    
+    if not p.exists():
+        raise FileNotFoundError(f"Data file not found: {p}")
+    
+    ext = p.suffix.lower()
     if ext in {".csv", ".tsv"}:
         sep = "\t" if ext == ".tsv" else ","
-        df = pd.read_csv(path, sep=sep)
+        df = pd.read_csv(str(p), sep=sep)
         return _parse_genre_list_column(df)
     if ext in {".pkl", ".pickle"}:
-        df = pd.read_pickle(path)
+        df = pd.read_pickle(str(p))
         return _parse_genre_list_column(df)
     raise ValueError(f"Unsupported data file extension: {ext}")
 
 
 def load_default_df() -> pd.DataFrame:
-    here = Path(__file__).resolve().parent
+    """
+    Load default dataset from src/data/ directory relative to this script.
+    Tries multiple file patterns in order of preference.
+    """
+    here = Path(__file__).resolve().parent  # src/ directory
     cand = [
+        here / "data" / "user_1_data.csv",
         here / "data" / "movie_user_data.pkl",
         here / "data" / "movie_user_data.csv",
     ]
     for p in cand:
         if p.exists():
+            print(f"[Init] Loading default data from: {p}")
             return load_df_from_path(str(p))
     raise FileNotFoundError(
         "No default dataset found. Provide a path argument or place a file at:\n"
-        "  src/data/movie_user_data.pkl  or  src/data/movie_user_data.csv"
+        "  src/data/user_1_data.csv, src/data/movie_user_data.pkl, or src/data/movie_user_data.csv"
     )
 
 
@@ -193,19 +211,21 @@ def print_verbose_from_last_log(orch: Orchestrator, header: str) -> None:
 # ---------------- system builder ----------------
 def resolve_resources_dir(cli_override: str | None = None) -> Path:
     """
-    Resolve resources directory in this order:
-    1) CLI override (absolute or relative to CWD)
-    2) ENV RESOURCES_DIR
-    3) Default: <project_root>/resources  (project_root = parent of src/)
+    Always resolve resources directory relative to the project structure.
+    Default: <project_root>/src/resources (project_root = parent of src/)
+    CLI override is still supported but converted to absolute path relative to project root.
     """
-    if cli_override:
-        p = Path(cli_override).expanduser().resolve()
-        return p
-    env = os.getenv("RESOURCES_DIR")
-    if env:
-        return Path(env).expanduser().resolve()
     project_root = Path(__file__).resolve().parent.parent  # repo root (contains src/)
-    return (project_root / "resources").resolve()
+    
+    if cli_override:
+        # If it's an absolute path, use it; otherwise resolve relative to project root
+        p = Path(cli_override)
+        if p.is_absolute():
+            return p.resolve()
+        return (project_root / cli_override).resolve()
+    
+    # Default: use src/resources (not resources at root level)
+    return (project_root / "src" / "resources").resolve()
 
 
 def debug_list_dir(path: Path, label: str):

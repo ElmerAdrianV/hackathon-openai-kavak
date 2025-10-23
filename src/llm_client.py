@@ -33,25 +33,14 @@ class LLMClient:
 
         If `settings` is None, sensible defaults are used.
         """
-        default_settings = {
-            "max_completion_tokens": 512,
-            "top_p": 1.0,
-            "frequency_penalty": 0.0,
-            "presence_penalty": 0.0,
-            "n": 1,
-        }
 
-        call_kwargs = default_settings.copy()
-        if settings:
-            call_kwargs.update(settings)
 
         response = self.client.chat.completions.create(
             model=model,
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
-            ],
-            **call_kwargs,
+            ]
         )
 
         # Extract content in a robust way depending on response shape

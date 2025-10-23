@@ -68,7 +68,6 @@ class Critic:
             persona = _read_text_file(path).strip()
         else:
             persona = f"You are a movie critic persona named '{self.critic_id}'. Rely only on provided context."
-
         # Enforce JSON response
         system_prompt = (persona + "\n\n" + _CRITIC_JSON_SPEC).strip()
         self._system_prompt_cache = system_prompt
@@ -118,14 +117,14 @@ class Critic:
         system_prompt = self._load_system_prompt()
         user_prompt = self._build_user_prompt(ctx)
 
+        
+        print("up="+user_prompt)  # debug
         raw = self.llm.generate(
             system_prompt=system_prompt,
             user_prompt=user_prompt,
-            model=self.model,
-            settings={"max_completion_tokens": 350},
-            force_json=True,  # enforce JSON mode on supported models
+            model=self.model
         )
-
+        print(raw) # debug
         data: Dict[str, Any] = extract_json_block(raw) or {}
         score = float(np.clip(data.get("score", 3.0), 0.0, 5.0))
         conf = float(np.clip(data.get("confidence", 0.5), 0.0, 1.0))
