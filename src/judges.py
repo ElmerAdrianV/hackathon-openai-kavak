@@ -128,6 +128,8 @@ class Judge:
             model=self.model
         )
 
+       # print("judges_raw="+raw) # debug
+
         data: Dict[str, Any] = extract_json_block(raw) or {}
 
         # r_tilde
@@ -179,11 +181,6 @@ class Judge:
 
         jo = JudgeOutput(self.judge_id, r_tilde, alphas, flags, justification)
 
-        # Attach raw for verbose logging (main_demo can print if orchestrator logs jo.__dict__)
-        try:
-            setattr(jo, "debug_raw", raw)
-        except Exception:
-            pass
 
         return jo
 

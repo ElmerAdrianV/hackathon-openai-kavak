@@ -20,6 +20,8 @@ from src.judges import Judge
 from src.llm_client import LLMClient
 from src.data_store import DataStore
 from src.retriever import Retriever
+from src.reviewer import Reviewer
+from src.prediction_logger import PredictionLogger
 
 VERBOSE = os.getenv("VERBOSE", "1") not in ("0", "false", "False")
 
@@ -77,7 +79,7 @@ def load_default_df() -> pd.DataFrame:
     """
     here = Path(__file__).resolve().parent  # src/ directory
     cand = [
-        here / "data" / "splits" / "train_users_1.csv"
+        here / "data" / "splits" / "user_45811_test.csv"
     ]
     for p in cand:
         if p.exists():
@@ -85,7 +87,7 @@ def load_default_df() -> pd.DataFrame:
             return load_df_from_path(str(p))
     raise FileNotFoundError(
         "No default dataset found. Provide a path argument or place a file at:\n"
-        "  src/data/splits/train_users_1.csv, src/data/user_1_data.csv, \n"
+        "  src/data/splits/user_45811_test.csv, src/data/user_1_data.csv, \n"
         "  src/data/movie_user_data.pkl, or src/data/movie_user_data.csv"
     )
 
@@ -94,12 +96,12 @@ def load_train_test_split() -> tuple[pd.DataFrame, pd.DataFrame | None]:
     """
     Load train/test split if available, otherwise return (train, None).
     Looks for:
-      - src/data/splits/train_users_1.csv + test_users_1.csv
+      - src/data/splits/user_45811_test.csv + user_45811_train.csv
       - Falls back to single dataset as train-only
     """
     here = Path(__file__).resolve().parent
-    train_path = here / "data" / "splits" / "train_users_1.csv"
-    test_path = here / "data" / "splits" / "test_users_1.csv"
+    train_path = here / "data" / "splits" / "user_45811_test.csv.csv"
+    test_path = here / "data" / "splits" / "user_45811_train.csv.csv"
     
     if train_path.exists() and test_path.exists():
         print(f"[Init] Loading train/test split:")
@@ -332,14 +334,17 @@ def build_system(
 
 
 # ---------------- demo flow ----------------
-def demo_flow( resources_dir: str | None = None):
+def demo_flow(resources_dir: str | None = None, n_samples: int = 10, review_interval: int = 5):
     """
     Demo flow with train/test split support.
     
-    If path_to_data is provided, it's used as train data (single file mode).
-    Otherwise, attempts to load train/test split from src/data/splits/
+    Iterates over multiple movies from the test set, showing how the system
+    learns and improves over time.
     
-    Evaluation is done on test set if available, otherwise on train (for demo purposes).
+    Args:
+        resources_dir: Path to resources directory
+        n_samples: Number of test samples to evaluate (default: 10)
+        review_interval: How often to run Reviewer analysis (default: 5)
     """
 
     # Try to load train/test split
@@ -351,65 +356,163 @@ def demo_flow( resources_dir: str | None = None):
         print("[Demo] No test set: evaluating on train data (demo mode)")
 
     orch = build_system(train_df, test_df, resources_dir=resources_dir)
+    
+    # Initialize Reviewer
+    reviewer = Reviewer(review_interval=review_interval)
+    
+    # Initialize Prediction Logger
+    pred_logger = PredictionLogger()
 
     if len(eval_df) == 0:
         print("Evaluation dataset is empty.")
         return
 
-    # ---- First example from eval set ----
-    row = eval_df.iloc[0]
-    u = str(row["userId"])
-    m = str(row["movieId"])
-    print(
-        f"\n[Demo] Evaluating row 0: userId={u}, movieId={m}, title={row.get('title', '')}"
-    )
+    # Limit samples to available data
+    n_samples = min(n_samples, len(eval_df))
+    print(f"\n{'='*80}")
+    print(f"🎬 Evaluando {n_samples} películas para demostrar el aprendizaje del sistema")
+    print(f"{'='*80}\n")
 
-    yhat, sigma, aux = orch.predict(user_id=u, movie_id=m)
-    print(f"[Predict 1] -> {yhat:.2f} ± {sigma:.2f} | aux={aux}")
-    if VERBOSE:
-        print_verbose_from_last_log(orch, "  --- Verbose details (after Predict 1) ---")
-
-    true_rating = float(row.get("rating", 3.0))
-    print(f"[Ground Truth] true_rating={true_rating:.2f}")
-    orch.online_update(true_rating=true_rating)
-    print(f"[Update] online_update with true_rating={true_rating:.2f}")
-
-    # ---- Second example from eval set ----
-    idx2 = 1 if len(eval_df) > 1 else 0
-    row2 = eval_df.iloc[idx2]
-    u2 = str(row2["userId"])
-    m2 = str(row2["movieId"])
-    print(
-        f"\n[Demo] Evaluating row {idx2}: userId={u2}, movieId={m2}, title={row2.get('title', '')}"
-    )
-
-    yhat2, sigma2, aux2 = orch.predict(user_id=u2, movie_id=m2)
-    print(f"[Predict 2] -> {yhat2:.2f} ± {sigma2:.2f} | aux={aux2}")
-    if VERBOSE:
-        print_verbose_from_last_log(orch, "  --- Verbose details (after Predict 2) ---")
-
-    true_rating2 = float(row2.get("rating", 3.0))
-    print(f"[Ground Truth] true_rating={true_rating2:.2f}")
-    orch.online_update(true_rating=true_rating2)
-    print(f"[Update] online_update with true_rating={true_rating2:.2f}\n")
+    errors = []
+    predictions = []
+    
+    # Iterate over multiple samples
+    for idx in range(n_samples):
+        row = eval_df.iloc[idx]
+        u = str(row["userId"])
+        m = str(row["movieId"])
+        title = row.get('title', 'Unknown')
+        true_rating = float(row.get("rating", 3.0))
+        
+        # Get genres if available
+        genres_list = row.get('genre_list', [])
+        if isinstance(genres_list, list):
+            genres = ', '.join(genres_list)
+        else:
+            genres = str(genres_list) if genres_list else ''
+        
+        # Make prediction
+        yhat, sigma, aux = orch.predict(user_id=u, movie_id=m)
+        error = abs(yhat - true_rating)
+        errors.append(error)
+        predictions.append(yhat)
+        
+        # Log to CSV file
+        pred_logger.log_prediction(
+            movie_id=m,
+            movie_title=title,
+            user_id=u,
+            predicted_rating=yhat,
+            predicted_sigma=sigma,
+            true_rating=true_rating,
+            genres=genres
+        )
+        
+        # Show progress
+        print(f"[{idx+1}/{n_samples}] {title[:40]:40s} | Pred: {yhat:.2f} ± {sigma:.2f} | Real: {true_rating:.2f} | Error: {error:.2f}")
+        
+        # Record prediction for reviewer analysis
+        events = orch.logger.read_all()
+        if events:
+            last_event = events[-1]
+            judge_outputs = last_event.get('judge_outputs', [])
+            critic_outputs = last_event.get('critic_outputs', [])
+            critic_ids = [c.get('critic_id') for c in critic_outputs] if critic_outputs else []
+            reviewer.record_prediction(judge_outputs, true_rating, critic_ids)
+        
+        # Update system with ground truth
+        orch.online_update(true_rating=true_rating)
+        
+        # Check if Reviewer should run
+        if reviewer.should_review():
+            report = reviewer.run_review()
+            reviewer.print_report(report)
+            
+            # Check for calibrator suggestions
+            suggestions = reviewer.suggest_calibrator_update()
+            if suggestions:
+                print(f"🔧 Calibrator Update Suggestions: {suggestions}")
+                print()
+        
+        # Show learning progress every 3 samples
+        elif (idx + 1) % 3 == 0 or idx == n_samples - 1:
+            recent_errors = errors[max(0, idx-2):idx+1]
+            avg_recent_error = sum(recent_errors) / len(recent_errors)
+            print(f"  📊 Error promedio últimas {len(recent_errors)} predicciones: {avg_recent_error:.3f}")
+            if idx >= 3:
+                prev_errors = errors[max(0, idx-5):max(1, idx-2)]
+                if prev_errors:
+                    avg_prev_error = sum(prev_errors) / len(prev_errors)
+                    improvement = avg_prev_error - avg_recent_error
+                    symbol = "📈" if improvement > 0 else "📉"
+                    print(f"  {symbol} Mejora: {improvement:+.3f} (calibrando críticos y jueces)")
+            print()
+    
+    # Final summary
+    avg_error = sum(errors) / len(errors)
+    first_half_error = sum(errors[:n_samples//2]) / max(1, n_samples//2)
+    second_half_error = sum(errors[n_samples//2:]) / max(1, len(errors[n_samples//2:]))
+    
+    print(f"\n{'='*80}")
+    print(f"📊 RESUMEN DEL APRENDIZAJE")
+    print(f"{'='*80}")
+    print(f"Error promedio total:           {avg_error:.3f}")
+    print(f"Error primera mitad:            {first_half_error:.3f}")
+    print(f"Error segunda mitad:            {second_half_error:.3f}")
+    print(f"Mejora observada:               {first_half_error - second_half_error:+.3f}")
+    print(f"{'='*80}\n")
+    
+    # Print prediction log summary
+    pred_logger.print_summary()
+    
+    # Run final review if we haven't just done one
+    if not reviewer.should_review() and reviewer.prediction_count > 0:
+        print("🔍 Ejecutando análisis final del Reviewer...")
+        final_report = reviewer.run_review()
+        reviewer.print_report(final_report)
 
 
 if __name__ == "__main__":
     # CLI:
-    #   python -m src.main_demo /abs/path/to/your.csv
-    #   python -m src.main_demo --resources /abs/path/to/resources  /abs/path/to/your.csv
+    #   python -m src.main_demo
+    #   python -m src.main_demo --resources /path/to/resources
+    #   python -m src.main_demo --samples 20
+    #   python -m src.main_demo --samples 20 --review-interval 10
+    #   python -m src.main_demo --resources /path/to/resources --samples 20 --review-interval 10
     args = sys.argv[1:]
     res_arg = None
-    data_arg = None
-    if args:
-        if args[0] == "--resources":
-            if len(args) < 2:
-                print(
-                    "Usage: python -m src.main_demo --resources /path/to/resources  [data_path]"
-                )
+    n_samples = 10  # default
+    review_interval = 5  # default
+    
+    i = 0
+    while i < len(args):
+        if args[i] == "--resources":
+            if i + 1 >= len(args):
+                print("Usage: python -m src.main_demo [--resources /path/to/resources] [--samples N] [--review-interval N]")
                 sys.exit(1)
-            res_arg = args[1]
-            data_arg = args[2] if len(args) > 2 else None
+            res_arg = args[i + 1]
+            i += 2
+        elif args[i] == "--samples":
+            if i + 1 >= len(args):
+                print("Usage: python -m src.main_demo [--resources /path/to/resources] [--samples N] [--review-interval N]")
+                sys.exit(1)
+            try:
+                n_samples = int(args[i + 1])
+            except ValueError:
+                print(f"Error: --samples debe ser un número entero, recibido: {args[i + 1]}")
+                sys.exit(1)
+            i += 2
+        elif args[i] in ("--review-interval", "--review"):
+            if i + 1 >= len(args):
+                print("Usage: python -m src.main_demo [--resources /path/to/resources] [--samples N] [--review-interval N]")
+                sys.exit(1)
+            try:
+                review_interval = int(args[i + 1])
+            except ValueError:
+                print(f"Error: --review-interval debe ser un número entero, recibido: {args[i + 1]}")
+                sys.exit(1)
+            i += 2
         else:
-            data_arg = args[0]
-    demo_flow(resources_dir=res_arg)
+            i += 1
+    
+    demo_flow(resources_dir=res_arg, n_samples=n_samples, review_interval=review_interval)

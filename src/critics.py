@@ -121,13 +121,13 @@ class Critic:
         user_prompt = self._build_user_prompt(ctx)
 
         #print("sp="+system_prompt)  # debug
-        print("up="+user_prompt)  # debug
+        #print("up="+user_prompt)  # debug
         raw = self.llm.generate(
             system_prompt=system_prompt,
             user_prompt=user_prompt,
             model=self.model
         )
-        #print("raw="+raw) # debug
+        #print("critics_raw="+raw) # debug
         data: Dict[str, Any] = extract_json_block(raw) or {}
         score = float(np.clip(data.get("score", 3.0), 0.0, 5.0))
         conf = float(np.clip(data.get("confidence", 0.5), 0.0, 1.0))
