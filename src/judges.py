@@ -1,91 +1,138 @@
 from __future__ import annotations
+
 import os
-import json
-from typing import List, Dict, Any, Optional
-from dataclasses import dataclass
+from typing import List, Optional, Dict, Any
 import numpy as np
 
-from .types import JudgeOutput, ContextPack, CriticOutput
 from .llm_client import LLMClient, extract_json_block
+from .types import ContextPack, CriticOutput, JudgeOutput
 
 
-def _load_system_prompt(resources_dir: str, judge_id: str) -> str:
-    """
-    Loads system prompt from resources/judges/{judge_id}.(txt|md)
-    """
-    base = os.path.join(resources_dir, "judges")
+def _read_text_file(path: str) -> str:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read()
+    except Exception:
+        return ""
+
+
+def _find_persona_file(resources_dir: str, subdir: str, agent_id: str) -> Optional[str]:
+    base = os.path.join(resources_dir, subdir, agent_id)
     for ext in (".txt", ".md"):
-        path = os.path.join(base, judge_id + ext)
-        if os.path.exists(path):
-            with open(path, "r", encoding="utf-8") as f:
-                return f.read()
-    # fallback
-    return f"You are a grounded debate judge: {judge_id}. Check support and calibrate."
+        p = base + ext
+        if os.path.exists(p):
+            return p
+    return None
 
 
-def _judge_user_prompt(
-    critics: List[CriticOutput], ctx: ContextPack, critic_track: Dict[str, float]
-) -> str:
-    """
-    Judge gets critics' outputs, plus simple performance priors.
-    Requires strict JSON output.
-    """
-    packed = {
-        "critics": [
-            {
-                "critic_id": c.critic_id,
-                "score": c.score,
-                "confidence": c.confidence,
-                "rationale": c.rationale,
-            }
-            for c in critics
-        ],
-        "movie_profile": ctx.movie_profile,
-        "user_history": ctx.user_profile.get("history", []),
-        "retrieved": ctx.retrieved,
-        "critic_track": critic_track,  # e.g., historical skill (can be zeros initially)
-    }
-    schema = (
-        "{\n"
-        '  "r_tilde": float,         // judge’s calibrated 0..5\n'
-        '  "alphas": [float,...],    // one per critic, >=0, sum≈1\n'
-        '  "flags": [0|1,...],       // one per critic (1=unsupported claims)\n'
-        '  "justification": "≤20 words"\n'
-        "}\n"
-    )
-    return (
-        "Read critics’ JSON and FACTS. Flag unsupported claims. Weight reliable critics.\n"
-        "Output strictly the JSON schema below (no prose):\n\n"
-        f"INPUT (JSON):\n```json\n{json.dumps(packed, ensure_ascii=False)}\n```\n\n"
-        f"OUTPUT SCHEMA:\n{schema}"
-    )
+# Appended to any judge system prompt to enforce a JSON contract.
+_JUDGE_JSON_SPEC = """
+Return STRICT JSON only with these exact keys:
+{
+  "r_tilde": number,            // calibrated score 0..5 from the debate
+  "alphas": [number, ...],      // weights for each critic, length MUST = number of critics, sums ~ 1
+  "flags": [0 or 1, ...],       // 1 if the critic made unsupported claims, else 0, length MUST = number of critics
+  "justification": string       // brief explanation of weighting and any penalties
+}
+No extra keys. No markdown. No prose outside the JSON.
+""".strip()
 
 
-@dataclass
 class Judge:
-    judge_id: str
-    resources_dir: str
-    llm: LLMClient
-    model: str = "gpt-5"
-    # EMA of negative MSE as a crude skill score
-    skill_score: float = 0.0
+    """
+    A single judge persona. Reads prompt from:
+      {resources_dir}/judges/{judge_id}.txt|md
+    """
 
+    def __init__(
+        self, judge_id: str, resources_dir: str, llm: LLMClient, model: str = "gpt-5"
+    ):
+        self.judge_id = judge_id
+        self.resources_dir = resources_dir
+        self.llm = llm
+        self.model = model
+        self.skill: float = 0.0  # EMA skill used by router
+        self._system_prompt_cache: Optional[str] = None
+
+    # ---- skill updates ----
+    def update_skill(self, true_rating: float, judge_pred: float, rho: float = 0.1):
+        # negative MSE as a score -> higher is better
+        err2 = float((true_rating - judge_pred) ** 2)
+        self.skill = (1.0 - rho) * self.skill + rho * (-err2)
+
+    def get_skill(self) -> float:
+        return self.skill
+
+    # ---- prompt build ----
+    def _load_system_prompt(self) -> str:
+        if self._system_prompt_cache is not None:
+            return self._system_prompt_cache
+
+        path = _find_persona_file(self.resources_dir, "judges", self.judge_id)
+        if path:
+            persona = _read_text_file(path).strip()
+        else:
+            persona = f"You are a grounded debate judge named '{self.judge_id}'. Verify claims; penalize unsupported ones."
+
+        system_prompt = (persona + "\n\n" + _JUDGE_JSON_SPEC).strip()
+        self._system_prompt_cache = system_prompt
+        return system_prompt
+
+    def _build_user_prompt(
+        self,
+        critics: List[CriticOutput],
+        ctx: ContextPack,
+        critic_track: Dict[str, float],
+    ) -> str:
+        movie = ctx.movie_profile or {}
+        up = ctx.user_profile or {}
+        lines = [
+            "Context:",
+            f"- User personality: {up.get('personality', '')}",
+            f"- Movie title: {movie.get('title', '')}",
+        ]
+
+        genres = movie.get("genres", [])
+        if isinstance(genres, list):
+            lines.append(f"- Movie genres: {', '.join(genres)}")
+        else:
+            lines.append(f"- Movie genres: {genres}")
+
+        lines.append("- Critics (id, score, confidence, rationale) in debate order:")
+        for c in critics:
+            lines.append(
+                f"  * {c.critic_id} | s={c.score:.2f} | q={c.confidence:.2f} | rationale: {(c.rationale or '').strip()} | track={critic_track.get(c.critic_id, 0.0):.3f}"
+            )
+
+        lines.append(
+            "\nTask: Produce a calibrated score r_tilde in 0..5."
+            " Choose alphas (weights) for each critic (length must equal number of critics, sum ~ 1)."
+            " flags[i]=1 if critic i used unsupported claims; else 0."
+            " Explain briefly in justification."
+        )
+        return "\n".join(lines)
+
+    # ---- judging ----
     def evaluate(
         self,
         critics: List[CriticOutput],
         ctx: ContextPack,
         critic_track: Dict[str, float],
     ) -> JudgeOutput:
-        system_prompt = _load_system_prompt(self.resources_dir, self.judge_id)
-        user_prompt = _judge_user_prompt(critics, ctx, critic_track)
-        txt = self.llm.generate(
+        system_prompt = self._load_system_prompt()
+        user_prompt = self._build_user_prompt(critics, ctx, critic_track)
+
+        raw = self.llm.generate(
             system_prompt=system_prompt,
             user_prompt=user_prompt,
             model=self.model,
             settings={"max_completion_tokens": 350},
+            force_json=True,
         )
-        data = extract_json_block(txt) or {}
-        # Parse with safe fallbacks
+
+        data: Dict[str, Any] = extract_json_block(raw) or {}
+
+        # r_tilde
         r_tilde = float(
             np.clip(
                 data.get(
@@ -95,32 +142,64 @@ class Judge:
                 5.0,
             )
         )
+
+        # alphas
         alphas = data.get("alphas", [])
-        if (not isinstance(alphas, list)) or (len(alphas) != len(critics)):
-            # fallback: proportional to critic confidence
-            confs = np.array([max(1e-6, c.confidence) for c in critics], dtype=float)
-            alphas = (confs / confs.sum()).tolist()
+        if not isinstance(alphas, list) or len(alphas) != len(critics):
+            # fallback: proportional to critic confidence, with tiny smoothing
+            qs = np.array(
+                [max(1e-3, float(c.confidence)) for c in critics], dtype=float
+            )
+            alphas = (
+                (qs / qs.sum()).tolist()
+                if qs.sum() > 0
+                else [1.0 / max(1, len(critics))] * len(critics)
+            )
         else:
-            alphas = [max(0.0, float(a)) for a in alphas]
-            s = sum(alphas)
-            alphas = [a / s if s > 0 else 1.0 / max(1, len(alphas)) for a in alphas]
+            try:
+                arr = np.array([float(a) for a in alphas], dtype=float)
+                s = arr.sum()
+                if s <= 0:
+                    arr = np.ones_like(arr) / len(arr)
+                else:
+                    arr = arr / s
+                alphas = arr.tolist()
+            except Exception:
+                alphas = [1.0 / max(1, len(critics))] * len(critics)
 
-        flags = data.get("flags", [0] * len(critics))
-        if (not isinstance(flags, list)) or (len(flags) != len(critics)):
+        # flags
+        flags = data.get("flags", [])
+        if not isinstance(flags, list) or len(flags) != len(critics):
             flags = [0] * len(critics)
-        flags = [1 if int(f) == 1 else 0 for f in flags]
+        else:
+            try:
+                flags = [int(bool(f)) for f in flags]
+            except Exception:
+                flags = [0] * len(critics)
 
-        justification = str(data.get("justification", "weighted blend"))
-        return JudgeOutput(self.judge_id, r_tilde, alphas, flags, justification)
+        justification = str(data.get("justification", "")).strip()
 
-    def update_skill(self, true_rating: float, r_tilde: float, rho: float = 0.1):
-        err = (true_rating - r_tilde) ** 2
-        self.skill_score = (1 - rho) * self.skill_score + rho * (-err)
+        jo = JudgeOutput(self.judge_id, r_tilde, alphas, flags, justification)
+
+        # Attach raw for verbose logging (main_demo can print if orchestrator logs jo.__dict__)
+        try:
+            setattr(jo, "debug_raw", raw)
+        except Exception:
+            pass
+
+        return jo
 
 
 class JudgePool:
+    """
+    Wraps many judges and exposes:
+      - run(...): evaluate with a selected subset of judges
+      - get_skill_table(): map judge_id -> skill
+    """
+
     def __init__(self, judges: List[Judge]):
         self.judges = judges
+        self.map = {j.judge_id: j for j in judges}
 
     def run(
         self,
@@ -129,11 +208,17 @@ class JudgePool:
         judge_ids: Optional[List[str]] = None,
         critic_track: Optional[Dict[str, float]] = None,
     ) -> List[JudgeOutput]:
-        critic_track = critic_track or {}
         chosen = [
-            j for j in self.judges if (judge_ids is None or j.judge_id in judge_ids)
+            self.map[jid]
+            for jid in (judge_ids or [j.judge_id for j in self.judges])
+            if jid in self.map
         ]
-        return [j.evaluate(critics, ctx, critic_track) for j in chosen]
+        track = critic_track or {}
+        outs: List[JudgeOutput] = []
+        for j in chosen:
+            out = j.evaluate(critics, ctx, track)
+            outs.append(out)
+        return outs
 
     def get_skill_table(self) -> Dict[str, float]:
-        return {j.judge_id: j.skill_score for j in self.judges}
+        return {j.judge_id: j.get_skill() for j in self.judges}

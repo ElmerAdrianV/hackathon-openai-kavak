@@ -58,6 +58,27 @@ class Orchestrator:
             critic_outs, ctx, judge_ids=chosen_judges, critic_track=self.critic_track
         )
 
+        judge_dicts = []
+        for jo in judge_outs:
+            d = jo.__dict__.copy()
+            # If judges.py attached 'debug_raw', keep it to inspect later
+            raw = getattr(jo, "debug_raw", None)
+            if raw:
+                d["raw"] = raw
+            judge_dicts.append(d)
+
+        ev = EventLog(
+            ts=now_ts(),
+            user_id=user_id,
+            movie_id=movie_id,
+            context={...},
+            critic_outputs=[c.__dict__ for c in critic_outs],
+            judge_outputs=judge_dicts,  # <-- use judge_dicts instead of [j.__dict__ ...]
+            yhat=yhat,
+            yhat_sigma=sigma,
+            feedback=None,
+        )
+
         x, disagreement = featurize(critic_outs, judge_outs, ctx, judge_skill)
         yhat, sigma = self.calibrator.predict(x, disagreement=disagreement)
 

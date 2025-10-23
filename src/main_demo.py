@@ -8,9 +8,11 @@ if __name__ == "__main__" and __package__ is None:
 
 import os
 import sys
+import glob
 import ast
+from pathlib import Path
+from typing import Dict, Any, List, Tuple
 import pandas as pd
-from typing import Dict, Any, List
 
 from src.orchestrator import Orchestrator, OrchestratorConfig
 from src.critics import Critic
@@ -19,11 +21,10 @@ from src.llm_client import LLMClient
 from src.data_store import DataStore
 from src.retriever import Retriever
 
-# Toggle verbose debug prints (can also set env VERBOSE=1)
 VERBOSE = os.getenv("VERBOSE", "1") not in ("0", "false", "False")
 
 
-# --------- data loading helpers ---------
+# ---------------- data loading helpers ----------------
 def _parse_genre_list_column(df: pd.DataFrame) -> pd.DataFrame:
     if (
         "genre_list" in df.columns
@@ -44,11 +45,6 @@ def _parse_genre_list_column(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def load_df_from_path(path: str) -> pd.DataFrame:
-    """
-    Load ratings+metadata dataframe from CSV or PKL.
-    Required: userId, movieId, rating, title, overview, genre_list
-    Optional: personality
-    """
     ext = os.path.splitext(path)[1].lower()
     if ext in {".csv", ".tsv"}:
         sep = "\t" if ext == ".tsv" else ","
@@ -61,21 +57,47 @@ def load_df_from_path(path: str) -> pd.DataFrame:
 
 
 def load_default_df() -> pd.DataFrame:
-    here = os.path.dirname(os.path.abspath(__file__))
+    here = Path(__file__).resolve().parent
     cand = [
-        os.path.join(here, "data", "movie_user_data.pkl"),
-        os.path.join(here, "data", "movie_user_data.csv"),
+        here / "data" / "movie_user_data.pkl",
+        here / "data" / "movie_user_data.csv",
     ]
     for p in cand:
-        if os.path.exists(p):
-            return load_df_from_path(p)
+        if p.exists():
+            return load_df_from_path(str(p))
     raise FileNotFoundError(
         "No default dataset found. Provide a path argument or place a file at:\n"
         "  src/data/movie_user_data.pkl  or  src/data/movie_user_data.csv"
     )
 
 
-# --------- pretty printers ---------
+# ---------------- discovery helpers ----------------
+def _discover_ids_under(dir_path: Path) -> List[str]:
+    ids: List[str] = []
+    for pattern in ("*.txt", "*.md"):
+        for p in dir_path.glob(pattern):
+            base = p.stem
+            if base not in ids:
+                ids.append(base)
+    ids.sort()
+    return ids
+
+
+def discover_critics(resources_dir: Path) -> List[str]:
+    mc_dir = resources_dir / "movie_critics"
+    if not mc_dir.is_dir():
+        return []
+    return _discover_ids_under(mc_dir)
+
+
+def discover_judges(resources_dir: Path) -> List[str]:
+    j_dir = resources_dir / "judges"
+    if not j_dir.is_dir():
+        return []
+    return _discover_ids_under(j_dir)
+
+
+# ---------------- pretty printers ----------------
 def _print_context_summary(ev: Dict[str, Any]) -> None:
     ctx = ev.get("context", {})
     movie = ctx.get("movie_profile", {}) or {}
@@ -102,12 +124,19 @@ def _print_critics(ev: Dict[str, Any]) -> List[str]:
     for c in cos:
         cid = c.get("critic_id", "?")
         ids.append(cid)
-        score = c.get("score")
-        conf = c.get("confidence")
+        score = float(c.get("score", 0.0))
+        conf = float(c.get("confidence", 0.0))
         rationale = (c.get("rationale") or "").strip().replace("\n", " ")
         print(
             f"    - {cid:12s} | score={score:.2f} | conf={conf:.2f} | rationale: {rationale}"
         )
+        raw = (c.get("flags", {}) or {}).get("llm_raw")
+        if raw:
+            print(
+                "      raw:",
+                raw[:300].replace("\n", " "),
+                "..." if len(raw) > 300 else "",
+            )
     return ids
 
 
@@ -119,12 +148,11 @@ def _print_judges(ev: Dict[str, Any], critic_ids: List[str]) -> None:
     print("  Judges:")
     for j in jos:
         jid = j.get("judge_id", "?")
-        rtilde = j.get("r_tilde")
+        rtilde = float(j.get("r_tilde", 0.0))
         just = (j.get("justification") or "").strip().replace("\n", " ")
         print(f"    - {jid:12s} | r_tilde={rtilde:.2f} | justification: {just}")
         alphas = j.get("alphas", [])
         flags = j.get("flags", [])
-        # align and print per-critic alphas/flags
         if alphas and len(alphas) == len(critic_ids):
             print("      critic weights (alpha) and flags:")
             for cid, a, f in zip(
@@ -132,7 +160,15 @@ def _print_judges(ev: Dict[str, Any], critic_ids: List[str]) -> None:
                 alphas,
                 flags if isinstance(flags, list) else [0] * len(alphas),
             ):
-                print(f"        * {cid:12s} | alpha={float(a):.3f} | flag={int(f)}")
+                try:
+                    a_f = float(a)
+                except:
+                    a_f = 0.0
+                try:
+                    f_i = int(f)
+                except:
+                    f_i = 0
+                print(f"        * {cid:12s} | alpha={a_f:.3f} | flag={f_i}")
         else:
             print(
                 "      (alphas/flags length mismatch or empty; judge fell back to defaults)"
@@ -154,24 +190,89 @@ def print_verbose_from_last_log(orch: Orchestrator, header: str) -> None:
     )
 
 
-# --------- system builder ---------
-def build_system(df: pd.DataFrame, resources_dir: str = "./resources") -> Orchestrator:
+# ---------------- system builder ----------------
+def resolve_resources_dir(cli_override: str | None = None) -> Path:
+    """
+    Resolve resources directory in this order:
+    1) CLI override (absolute or relative to CWD)
+    2) ENV RESOURCES_DIR
+    3) Default: <project_root>/resources  (project_root = parent of src/)
+    """
+    if cli_override:
+        p = Path(cli_override).expanduser().resolve()
+        return p
+    env = os.getenv("RESOURCES_DIR")
+    if env:
+        return Path(env).expanduser().resolve()
+    project_root = Path(__file__).resolve().parent.parent  # repo root (contains src/)
+    return (project_root / "resources").resolve()
+
+
+def debug_list_dir(path: Path, label: str):
+    try:
+        print(f"[Debug] Listing {label} at: {path}")
+        if not path.exists():
+            print("  (path does not exist)")
+            return
+        if not path.is_dir():
+            print("  (path exists but is not a directory)")
+            return
+        for entry in sorted(path.iterdir()):
+            print("  -", entry.name)
+    except Exception as e:
+        print(f"[Debug] Could not list {label}: {e}")
+
+
+def build_system(df: pd.DataFrame, resources_dir: str | None = None) -> Orchestrator:
+    resources_path = resolve_resources_dir(resources_dir)
+    print(f"[Init] resources_dir resolved to: {resources_path}")
+
+    mc_dir = resources_path / "movie_critics"
+    j_dir = resources_path / "judges"
+
+    critic_ids = discover_critics(resources_path)
+    judge_ids = discover_judges(resources_path)
+
+    if not critic_ids:
+        debug_list_dir(resources_path, "resources_dir")
+        debug_list_dir(mc_dir, "movie_critics")
+        raise RuntimeError(
+            f"No critic prompts found under {mc_dir}. "
+            f"Add files like 'cinephile.txt' there."
+        )
+    if not judge_ids:
+        debug_list_dir(resources_path, "resources_dir")
+        debug_list_dir(j_dir, "judges")
+        raise RuntimeError(
+            f"No judge prompts found under {j_dir}. "
+            f"Add files like 'grounded_v1.txt' there."
+        )
+
     llm = LLMClient()
 
-    critics = [
-        Critic(critic_id="cinephile", resources_dir=resources_dir, llm=llm),
-        Critic(critic_id="mcu_fan", resources_dir=resources_dir, llm=llm),
-        Critic(critic_id="romcom", resources_dir=resources_dir, llm=llm),
-        Critic(critic_id="stats", resources_dir=resources_dir, llm=llm),
-        Critic(critic_id="horrorhead", resources_dir=resources_dir, llm=llm),
-    ]
-    judges = [
-        Judge(judge_id="grounded_v1", resources_dir=resources_dir, llm=llm),
-        Judge(judge_id="strict_v1", resources_dir=resources_dir, llm=llm),
+    # Optional ordering preference
+    preferred_critics = ["cinephile", "romcom", "stats", "mcu_fan", "horrorhead"]
+    ordered_critics = [c for c in preferred_critics if c in critic_ids] + [
+        c for c in critic_ids if c not in preferred_critics
     ]
 
+    critics = [
+        Critic(critic_id=cid, resources_dir=str(resources_path), llm=llm)
+        for cid in ordered_critics
+    ]
+    judges = [
+        Judge(judge_id=jid, resources_dir=str(resources_path), llm=llm)
+        for jid in judge_ids
+    ]
+
+    print(f"[Init] Loaded critics: {', '.join([c.critic_id for c in critics])}")
+    print(f"[Init] Loaded judges : {', '.join([j.judge_id  for j in judges ])}")
+
     cfg = OrchestratorConfig(
-        resources_dir=resources_dir, k_critics=4, k_judges=1, calibrator_dim=8
+        resources_dir=str(resources_path),
+        k_critics=min(4, len(critics)),
+        k_judges=1,
+        calibrator_dim=8,
     )
 
     store = DataStore(df)
@@ -179,16 +280,15 @@ def build_system(df: pd.DataFrame, resources_dir: str = "./resources") -> Orches
     return Orchestrator(critics, judges, retriever, cfg)
 
 
-# --------- demo flow ---------
-def demo_flow(path_to_data: str | None = None):
+# ---------------- demo flow ----------------
+def demo_flow(path_to_data: str | None = None, resources_dir: str | None = None):
     if path_to_data:
         df = load_df_from_path(path_to_data)
     else:
         df = load_default_df()
 
-    orch = build_system(df)
+    orch = build_system(df, resources_dir=resources_dir)
 
-    # pick two rows to demonstrate predict -> update -> predict
     if len(df) == 0:
         print("Dataset is empty.")
         return
@@ -206,7 +306,6 @@ def demo_flow(path_to_data: str | None = None):
     if VERBOSE:
         print_verbose_from_last_log(orch, "  --- Verbose details (after Predict 1) ---")
 
-    # feedback
     true_rating = float(row.get("rating", 3.0))
     orch.online_update(true_rating=true_rating)
     print(f"[Update] online_update with true_rating={true_rating:.2f}")
@@ -231,9 +330,21 @@ def demo_flow(path_to_data: str | None = None):
 
 
 if __name__ == "__main__":
-    # Usage:
+    # CLI:
     #   python -m src.main_demo /abs/path/to/your.csv
-    #   python -m src.main_demo /abs/path/to/your.pkl
-    #   python -m src.main_demo               # looks under src/data/
-    arg_path = sys.argv[1] if len(sys.argv) > 1 else None
-    demo_flow(arg_path)
+    #   python -m src.main_demo --resources /abs/path/to/resources  /abs/path/to/your.csv
+    args = sys.argv[1:]
+    res_arg = None
+    data_arg = None
+    if args:
+        if args[0] == "--resources":
+            if len(args) < 2:
+                print(
+                    "Usage: python -m src.main_demo --resources /path/to/resources  [data_path]"
+                )
+                sys.exit(1)
+            res_arg = args[1]
+            data_arg = args[2] if len(args) > 2 else None
+        else:
+            data_arg = args[0]
+    demo_flow(data_arg, resources_dir=res_arg)
