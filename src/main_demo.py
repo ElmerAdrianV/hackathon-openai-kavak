@@ -10,6 +10,7 @@ import os
 import sys
 import ast
 import pandas as pd
+from typing import Dict, Any, List
 
 from src.orchestrator import Orchestrator, OrchestratorConfig
 from src.critics import Critic
@@ -18,24 +19,12 @@ from src.llm_client import LLMClient
 from src.data_store import DataStore
 from src.retriever import Retriever
 
+# Toggle verbose debug prints (can also set env VERBOSE=1)
+VERBOSE = os.getenv("VERBOSE", "1") not in ("0", "false", "False")
+
 
 # --------- data loading helpers ---------
-def load_df_from_path(path: str) -> pd.DataFrame:
-    """
-    Load your ratings+metadata dataframe from CSV or pickle.
-    Required columns: userId, movieId, rating, title, overview, genre_list
-    Optional: personality
-    """
-    ext = os.path.splitext(path)[1].lower()
-    if ext in {".csv", ".tsv"}:
-        sep = "\t" if ext == ".tsv" else ","
-        df = pd.read_csv(path, sep=sep)
-    elif ext in {".pkl", ".pickle"}:
-        df = pd.read_pickle(path)
-    else:
-        raise ValueError(f"Unsupported data file extension: {ext}")
-
-    # Convert genre_list strings like "['Drama','Romance']" into lists
+def _parse_genre_list_column(df: pd.DataFrame) -> pd.DataFrame:
     if (
         "genre_list" in df.columns
         and len(df) > 0
@@ -49,26 +38,29 @@ def load_df_from_path(path: str) -> pd.DataFrame:
                 return []
 
         df["genre_list"] = df["genre_list"].apply(_to_list)
-
-    # Ensure required columns exist
-    needed = ["userId", "movieId", "rating", "title", "overview", "genre_list"]
-    missing = [c for c in needed if c not in df.columns]
-    if missing:
-        raise ValueError(f"DataFrame missing required columns: {missing}")
-
-    # Optional column: personality
     if "personality" not in df.columns:
         df["personality"] = ""
-
     return df
 
 
+def load_df_from_path(path: str) -> pd.DataFrame:
+    """
+    Load ratings+metadata dataframe from CSV or PKL.
+    Required: userId, movieId, rating, title, overview, genre_list
+    Optional: personality
+    """
+    ext = os.path.splitext(path)[1].lower()
+    if ext in {".csv", ".tsv"}:
+        sep = "\t" if ext == ".tsv" else ","
+        df = pd.read_csv(path, sep=sep)
+        return _parse_genre_list_column(df)
+    if ext in {".pkl", ".pickle"}:
+        df = pd.read_pickle(path)
+        return _parse_genre_list_column(df)
+    raise ValueError(f"Unsupported data file extension: {ext}")
+
+
 def load_default_df() -> pd.DataFrame:
-    """
-    Try a sensible default path:
-      - src/data/movie_user_data.pkl
-      - or src/data/movie_user_data.csv
-    """
     here = os.path.dirname(os.path.abspath(__file__))
     cand = [
         os.path.join(here, "data", "movie_user_data.pkl"),
@@ -83,11 +75,89 @@ def load_default_df() -> pd.DataFrame:
     )
 
 
+# --------- pretty printers ---------
+def _print_context_summary(ev: Dict[str, Any]) -> None:
+    ctx = ev.get("context", {})
+    movie = ctx.get("movie_profile", {}) or {}
+    title = movie.get("title", "")
+    genres = movie.get("genres", [])
+    personality = ctx.get("user_personality", "")
+    print("  Context:")
+    print(f"    title: {title}")
+    if isinstance(genres, list):
+        print(f"    genres: {', '.join(genres)}")
+    else:
+        print(f"    genres: {genres}")
+    if personality:
+        print(f"    personality: {personality}")
+
+
+def _print_critics(ev: Dict[str, Any]) -> List[str]:
+    cos = ev.get("critic_outputs", []) or []
+    print("  Critics:")
+    ids = []
+    if not cos:
+        print("    (none)")
+        return ids
+    for c in cos:
+        cid = c.get("critic_id", "?")
+        ids.append(cid)
+        score = c.get("score")
+        conf = c.get("confidence")
+        rationale = (c.get("rationale") or "").strip().replace("\n", " ")
+        print(
+            f"    - {cid:12s} | score={score:.2f} | conf={conf:.2f} | rationale: {rationale}"
+        )
+    return ids
+
+
+def _print_judges(ev: Dict[str, Any], critic_ids: List[str]) -> None:
+    jos = ev.get("judge_outputs", []) or []
+    if not jos:
+        print("  Judges: (none)")
+        return
+    print("  Judges:")
+    for j in jos:
+        jid = j.get("judge_id", "?")
+        rtilde = j.get("r_tilde")
+        just = (j.get("justification") or "").strip().replace("\n", " ")
+        print(f"    - {jid:12s} | r_tilde={rtilde:.2f} | justification: {just}")
+        alphas = j.get("alphas", [])
+        flags = j.get("flags", [])
+        # align and print per-critic alphas/flags
+        if alphas and len(alphas) == len(critic_ids):
+            print("      critic weights (alpha) and flags:")
+            for cid, a, f in zip(
+                critic_ids,
+                alphas,
+                flags if isinstance(flags, list) else [0] * len(alphas),
+            ):
+                print(f"        * {cid:12s} | alpha={float(a):.3f} | flag={int(f)}")
+        else:
+            print(
+                "      (alphas/flags length mismatch or empty; judge fell back to defaults)"
+            )
+
+
+def print_verbose_from_last_log(orch: Orchestrator, header: str) -> None:
+    events = orch.logger.read_all()
+    if not events:
+        print("  (no events logged)")
+        return
+    ev = events[-1]
+    print(header)
+    _print_context_summary(ev)
+    critic_ids = _print_critics(ev)
+    _print_judges(ev, critic_ids)
+    print(
+        f"  Final: yhat={ev.get('yhat', None)} | sigma={ev.get('yhat_sigma', None)}\n"
+    )
+
+
 # --------- system builder ---------
 def build_system(df: pd.DataFrame, resources_dir: str = "./resources") -> Orchestrator:
     llm = LLMClient()
 
-    # You have cinephile + grounded_v1 prompts already; others will use fallback system prompts if files are missing.
     critics = [
         Critic(critic_id="cinephile", resources_dir=resources_dir, llm=llm),
         Critic(critic_id="mcu_fan", resources_dir=resources_dir, llm=llm),
@@ -95,7 +165,6 @@ def build_system(df: pd.DataFrame, resources_dir: str = "./resources") -> Orches
         Critic(critic_id="stats", resources_dir=resources_dir, llm=llm),
         Critic(critic_id="horrorhead", resources_dir=resources_dir, llm=llm),
     ]
-
     judges = [
         Judge(judge_id="grounded_v1", resources_dir=resources_dir, llm=llm),
         Judge(judge_id="strict_v1", resources_dir=resources_dir, llm=llm),
@@ -124,6 +193,7 @@ def demo_flow(path_to_data: str | None = None):
         print("Dataset is empty.")
         return
 
+    # ---- First example ----
     row = df.iloc[0]
     u = str(row["userId"])
     m = str(row["movieId"])
@@ -133,14 +203,15 @@ def demo_flow(path_to_data: str | None = None):
 
     yhat, sigma, aux = orch.predict(user_id=u, movie_id=m)
     print(f"[Predict 1] -> {yhat:.2f} ± {sigma:.2f} | aux={aux}")
+    if VERBOSE:
+        print_verbose_from_last_log(orch, "  --- Verbose details (after Predict 1) ---")
 
-    # if rating exists, feed it as feedback
+    # feedback
     true_rating = float(row.get("rating", 3.0))
     orch.online_update(true_rating=true_rating)
     print(f"[Update] online_update with true_rating={true_rating:.2f}")
 
-    # second example: prefer same user with a different movie if possible
-    # else, just take next row
+    # ---- Second example ----
     idx2 = 1 if len(df) > 1 else 0
     row2 = df.iloc[idx2]
     u2 = str(row2["userId"])
@@ -151,8 +222,9 @@ def demo_flow(path_to_data: str | None = None):
 
     yhat2, sigma2, aux2 = orch.predict(user_id=u2, movie_id=m2)
     print(f"[Predict 2] -> {yhat2:.2f} ± {sigma2:.2f} | aux={aux2}")
+    if VERBOSE:
+        print_verbose_from_last_log(orch, "  --- Verbose details (after Predict 2) ---")
 
-    # Optional: update again
     true_rating2 = float(row2.get("rating", 3.0))
     orch.online_update(true_rating=true_rating2)
     print(f"[Update] online_update with true_rating={true_rating2:.2f}\n")
@@ -161,11 +233,7 @@ def demo_flow(path_to_data: str | None = None):
 if __name__ == "__main__":
     # Usage:
     #   python -m src.main_demo /abs/path/to/your.csv
-    # or:
-    #   python src/main_demo.py /abs/path/to/your.pkl
-    # or (with default data under src/data/):
-    #   python -m src.main_demo
-    arg_path = (
-        "/Users/alef/Documents/GitHub/hackathon-openai-kavak/src/data/user_1_data.csv"
-    )
+    #   python -m src.main_demo /abs/path/to/your.pkl
+    #   python -m src.main_demo               # looks under src/data/
+    arg_path = sys.argv[1] if len(sys.argv) > 1 else None
     demo_flow(arg_path)
