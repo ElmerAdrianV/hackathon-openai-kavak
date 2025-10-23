@@ -2,3 +2,7 @@
 .venv
 /src/data/*.csv
 /src/data/*.pkl
+src/__pycache__/
+src/data/__pycache__/
+.DS_Store
+logs/
