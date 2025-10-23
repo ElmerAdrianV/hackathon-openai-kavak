@@ -11,7 +11,7 @@ class OnlineCalibrator:
 
     def __init__(self, dim: int, lr: float = 1e-2, l2: float = 1e-4):
         self.w = np.zeros(dim, dtype=float)
-        self.b = 0.0
+        self.b = 3.0
         self.lr = lr
         self.l2 = l2
         self.sigma_base = 0.75
