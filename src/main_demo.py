@@ -100,8 +100,8 @@ def load_train_test_split() -> tuple[pd.DataFrame, pd.DataFrame | None]:
       - Falls back to single dataset as train-only
     """
     here = Path(__file__).resolve().parent
-    train_path = here / "data" / "splits" / "user_45811_test.csv.csv"
-    test_path = here / "data" / "splits" / "user_45811_train.csv.csv"
+    train_path = here / "data" / "splits" / "user_45811_test.csv"
+    test_path = here / "data" / "splits" / "user_45811_train.csv"
     
     if train_path.exists() and test_path.exists():
         print(f"[Init] Loading train/test split:")
@@ -357,8 +357,16 @@ def demo_flow(resources_dir: str | None = None, n_samples: int = 10, review_inte
 
     orch = build_system(train_df, test_df, resources_dir=resources_dir)
     
-    # Initialize Reviewer
-    reviewer = Reviewer(review_interval=review_interval)
+    # Get resources path and LLM for Reviewer
+    resources_path = resolve_resources_dir(resources_dir)
+    llm = LLMClient()
+    
+    # Initialize Reviewer with capabilities to improve judges
+    reviewer = Reviewer(
+        review_interval=review_interval,
+        resources_dir=str(resources_path),
+        llm=llm
+    )
     
     # Initialize Prediction Logger
     pred_logger = PredictionLogger()
@@ -428,6 +436,17 @@ def demo_flow(resources_dir: str | None = None, n_samples: int = 10, review_inte
             report = reviewer.run_review()
             reviewer.print_report(report)
             
+            # Automatically improve worst performing judge
+            improvement_info = reviewer.improve_worst_judge(report)
+            if improvement_info:
+                print(f"\n{'='*80}")
+                print(f"🔄 JUDGE IMPROVEMENT")
+                print(f"{'='*80}")
+                print(f"Replaced: {improvement_info['original_judge']}")
+                print(f"New version: {improvement_info['new_judge']}")
+                print(f"Reason: {improvement_info['reason']}")
+                print(f"{'='*80}\n")
+            
             # Check for calibrator suggestions
             suggestions = reviewer.suggest_calibrator_update()
             if suggestions:
@@ -470,6 +489,27 @@ def demo_flow(resources_dir: str | None = None, n_samples: int = 10, review_inte
         print("🔍 Ejecutando análisis final del Reviewer...")
         final_report = reviewer.run_review()
         reviewer.print_report(final_report)
+        
+        # Try to improve worst judge one more time
+        final_improvement = reviewer.improve_worst_judge(final_report)
+        if final_improvement:
+            print(f"\n{'='*80}")
+            print(f"🔄 FINAL JUDGE IMPROVEMENT")
+            print(f"{'='*80}")
+            print(f"Replaced: {final_improvement['original_judge']}")
+            print(f"New version: {final_improvement['new_judge']}")
+            print(f"Reason: {final_improvement['reason']}")
+            print(f"{'='*80}\n")
+    
+    # Print improvement history if any
+    if reviewer.improvement_history:
+        print(f"\n{'='*80}")
+        print(f"📜 JUDGE IMPROVEMENT HISTORY")
+        print(f"{'='*80}")
+        for i, imp in enumerate(reviewer.improvement_history, 1):
+            print(f"{i}. {imp['original_judge']} → {imp['new_judge']}")
+            print(f"   Error: {imp['original_error']:.3f} | Reason: {imp['reason']}")
+        print(f"{'='*80}\n")
 
 
 if __name__ == "__main__":

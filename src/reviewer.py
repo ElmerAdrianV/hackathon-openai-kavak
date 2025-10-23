@@ -6,12 +6,15 @@ The Reviewer periodically analyzes:
 - Critic weight distributions (alphas)
 - Overall system calibration quality
 - Suggests adjustments to prompts or calibrator parameters
+- Automatically improves underperforming judges
 """
 
 from __future__ import annotations
 from typing import Dict, Any, List, Optional, Tuple
 from dataclasses import dataclass
+from pathlib import Path
 import statistics
+import datetime
 
 
 @dataclass
@@ -62,25 +65,33 @@ class Reviewer:
     1. Collects statistics on judge predictions vs ground truth
     2. Analyzes critic weight distributions (alpha values)
     3. Identifies well-performing vs struggling judges
-    4. Suggests prompt modifications or calibrator adjustments
-    5. Provides actionable insights for system improvement
+    4. Automatically improves underperforming judge prompts
+    5. Creates evolved versions with better instructions
     """
     
-    def __init__(self, review_interval: int = 5):
+    def __init__(self, review_interval: int = 5, resources_dir: Optional[str] = None, llm=None):
         """
         Initialize Reviewer.
         
         Args:
             review_interval: How often (in predictions) to run a review
+            resources_dir: Path to resources directory for judge prompts
+            llm: LLM client for generating improved prompts
         """
         self.review_interval = review_interval
         self.prediction_count = 0
+        self.resources_dir = resources_dir
+        self.llm = llm
         
         # Storage for analysis
         self.history: List[Dict[str, Any]] = []
         self.judge_predictions: Dict[str, List[float]] = {}
         self.judge_errors: Dict[str, List[float]] = {}
         self.critic_alpha_totals: Dict[str, List[float]] = {}
+        
+        # Track judge improvements
+        self.judge_version_counter: Dict[str, int] = {}
+        self.improvement_history: List[Dict[str, Any]] = []
         
         # Review reports
         self.reports: List[ReviewReport] = []
@@ -382,3 +393,125 @@ class Reviewer:
         self.judge_errors.clear()
         self.critic_alpha_totals.clear()
         self.prediction_count = 0
+    
+    def improve_worst_judge(self, report: ReviewReport) -> Optional[Dict[str, Any]]:
+        """
+        Automatically improve the worst performing judge by:
+        1. Reading its current prompt
+        2. Analyzing its errors
+        3. Generating an improved version with LLM
+        4. Creating a new judge file with versioned name
+        
+        Args:
+            report: ReviewReport with judge statistics
+            
+        Returns:
+            Dict with improvement details or None if cannot improve
+        """
+        if not report.worst_judge or not self.resources_dir or not self.llm:
+            return None
+        
+        worst_judge_id = report.worst_judge
+        worst_stats = next((js for js in report.judge_stats if js.judge_id == worst_judge_id), None)
+        
+        if not worst_stats or worst_stats.avg_error < 0.7:
+            # Don't improve if error is already low
+            return None
+        
+        # Read current prompt
+        judges_dir = Path(self.resources_dir) / "judges"
+        current_prompt_path = judges_dir / f"{worst_judge_id}.txt"
+        
+        if not current_prompt_path.exists():
+            print(f"⚠️  Cannot find prompt file: {current_prompt_path}")
+            return None
+        
+        with open(current_prompt_path, 'r') as f:
+            current_prompt = f.read()
+        
+        # Increment version counter
+        if worst_judge_id not in self.judge_version_counter:
+            self.judge_version_counter[worst_judge_id] = 1
+        else:
+            self.judge_version_counter[worst_judge_id] += 1
+        
+        version = self.judge_version_counter[worst_judge_id]
+        new_judge_id = f"{worst_judge_id}_v{version}"
+        
+        # Generate improvement prompt for LLM
+        improvement_request = f"""You are an expert at improving judge prompts for movie rating prediction systems.
+
+CURRENT JUDGE: {worst_judge_id}
+PERFORMANCE STATS:
+- Average Error: {worst_stats.avg_error:.3f}
+- Consistency (std): {worst_stats.std_error:.3f}
+- Number of predictions: {len(worst_stats.predictions)}
+
+CURRENT PROMPT:
+{current_prompt}
+
+TASK:
+Improve this judge prompt to reduce prediction errors. The judge's role is to:
+1. Evaluate multiple critic opinions about a movie
+2. Assign weights (alphas) to each critic based on their reasoning quality
+3. Produce a calibrated rating prediction (r_tilde)
+
+SPECIFIC IMPROVEMENTS NEEDED:
+- Better instructions for handling conflicting critic opinions
+- More precise guidance on assigning alpha weights
+- Clearer criteria for evaluating critic reasoning quality
+- Better calibration of final prediction based on weighted evidence
+
+Return ONLY the improved prompt text, no explanations or metadata.
+The prompt should be concise but comprehensive (300-500 words).
+"""
+
+        try:
+            print(f"\n🔧 Generating improved prompt for {worst_judge_id}...")
+            improved_prompt = self.llm.generate(
+                system_prompt="""You are proposing improvements to a judge prompt where you have to varied the personality and the tone of the judge. EXAMPLE 
+                You are a confidence-weighted judge who trusts self-assured critics with strong convictions.
+Amplify the influence of critics expressing high confidence. Discount uncertain or hedging opinions.
+MUST HAVE THE FOLLOWING INSTRUCTIONS:
+Verify each critic rationale against FACTS. Set flags=1 for unsupported claims.
+Weight critics with supported rationales and reliable confidence.
+Produce normalized alphas weighing the relevance of the opinion of each critic, and report the corresponding r_tilde such that it is a weighted average of the critic scores and the alphas you created.
+Output STRICT JSON only.
+
+                """,
+                user_prompt=improvement_request,
+            )
+            
+            # Save new prompt
+            new_prompt_path = judges_dir / f"{new_judge_id}.txt"
+            with open(new_prompt_path, 'w') as f:
+                f.write(improved_prompt)
+            
+            # Log improvement
+            improvement_info = {
+                'timestamp': datetime.datetime.now().isoformat(),
+                'original_judge': worst_judge_id,
+                'new_judge': new_judge_id,
+                'original_error': worst_stats.avg_error,
+                'original_std': worst_stats.std_error,
+                'version': version,
+                'prompt_path': str(new_prompt_path),
+                'reason': f"High error ({worst_stats.avg_error:.3f}) and/or inconsistency ({worst_stats.std_error:.3f})"
+            }
+            self.improvement_history.append(improvement_info)
+            
+            print(f"✅ Created improved judge: {new_judge_id}")
+            print(f"📝 Saved to: {new_prompt_path}")
+            print(f"📊 Original error: {worst_stats.avg_error:.3f} → Target: < 0.7")
+            print(f"🎯 Why: {improvement_info['reason']}")
+            
+            # Show snippet of changes
+            print(f"\n📄 New prompt preview:")
+            preview = improved_prompt[:200].replace('\n', ' ')
+            print(f"   {preview}...")
+            
+            return improvement_info
+            
+        except Exception as e:
+            print(f"❌ Error generating improved prompt: {e}")
+            return None
