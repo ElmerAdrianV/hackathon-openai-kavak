@@ -63,11 +63,7 @@ Un sistema **multi-agente auto-evolutivo** que:
          │  (Train/Test)    │──────│  (User Context)  │
          └──────────────────┘      └──────────────────┘
                     │
-                    ↓
-         ┌──────────────────────────────────────────┐
-         │           ROUTER (Bandit)                 │
-         │  Selecciona críticos y jueces óptimos    │
-         └──────────────┬───────────────────────────┘
+                     ───
                         │
             ┌───────────┴───────────┐
             ↓                       ↓
