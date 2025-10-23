@@ -67,6 +67,6 @@ if __name__ == "__main__":
 
     system_prompt = "You are a helpful assistant."
     user_prompt = "Hello, how can you assist me today?"
-    response = caller.call_api(system_prompt, user_prompt, model="gpt-5")
+    response = caller.generate(system_prompt, user_prompt, model="gpt-5")
     print(response)
     
