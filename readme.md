@@ -1,16 +1,35 @@
-# Recomendación de películas
+# Agentic Movie Recommender — Debate + Judge (Boilerplate)
 
-## Arquitectura
+This is a **scaffold** for the Debate + Judge recommender with an **Orchestrator agent**,
+**Critic tool-agents**, **Judge tool-agents**, a **Calibrator** head, and a **Router** (bandit policy).
+It is intentionally minimal so you can plug in your own prompts, rules, and update logic.
 
-### Main.py
-Encargado de realizar las llamadas de al chief reviewer, a la base de datos.
-Será tanbien el que dado un usuario dara una recomendación de una nueva película.
+## Layout
+```
+agentic_rec/
+  ├─ docs/
+      ├─
+  ├─ src/
+  │   ├─ orchestrator.py       # primary agent: routing, debate, aggregation, updates
+  │   ├─ critics.py            # critic personae + manager
+  │   ├─ judges.py             # judges + skill tracking
+  │   ├─ calibrator.py         # online regressor + uncertainty head (stub)
+  │   ├─ router.py             # routing/bandit policy for critics/judges
+  │   ├─ retriever.py          # user/movie context retrieval (stub)
+  │   ├─ features.py           # feature builders for calibrator
+  │   ├─ logging_store.py      # event logging and replay helpers
+  │   ├─ types.py              # dataclasses for typed IO
+  │   ├─ llm_client.py         # interface to your LLM provider (stub)
+  │   └─ main_demo.py          # runnable demo with dummy components
+  └─ requirements.txt
+```
 
-### Chief-reviewer.py
-Donde se ejecuta el feedback loop. Durante el entrenamiento recibe del main la terna
-[Usuario(personalidad/definicion, peliculas_vistas[]), Pelicula(nombre, sipnosis), Rating_Usuario]-> genera Rating_predicho al consultar con los reviewers con personalidad y modifica pesos.
-Para la fase de recomendación recibe del main la terna
-[Usuario(personalidad/definicion, peliculas_vistas[]), Pelicula(nombre, sipnosis), Rating_Usuario] -> compara todas las peliculas y le dara la que más le gusta. (se podra comparar veracidad con cross-validation)
+## Quick start
+1) Open `src/main_demo.py` and run it. It uses dummy critics/judges to prove the pipeline works.
+2) Replace stubs in `llm_client.py` with your actual LLM calls and add real prompts in `critics.py` / `judges.py`.
+3) Implement your **update loops** inside `orchestrator.py` (`online_update`, `nightly_evolution`).
 
-### reviewers.py
-Es la clase que llama a OpenAI API, esta clase representa un conjunto de distintos reviewers donde cada uno tiene definida una personalidad en resources (que es el system_prompt), debemos de tener hay una llamada de api por cada uno de los usuario
+## Notes
+- The calibrator is a tiny online linear regressor written from scratch (no external ML deps).
+- Everything is typed but simplified to keep the boilerplate portable.
+- Logging writes JSONL to `./logs/events.jsonl` by default.

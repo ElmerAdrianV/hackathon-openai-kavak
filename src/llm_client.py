@@ -4,13 +4,13 @@ from openai import OpenAI
 from typing import Optional, Dict, List
 
 
-class ChatGPTCCaller:
+class LLMClient:
     def __init__(self):
         load_dotenv()
         api_key = os.getenv("OPENAI_API_KEY")
         self.client = OpenAI(api_key=api_key) if api_key else OpenAI()
 
-    def call_api(
+    def generate(
         self,
         system_prompt: str,
         user_prompt: str,
@@ -63,9 +63,10 @@ class ChatGPTCCaller:
 
 
 if __name__ == "__main__":
-    caller = ChatGPTCCaller()
+    caller = LLMClient()
 
     system_prompt = "You are a helpful assistant."
     user_prompt = "Hello, how can you assist me today?"
     response = caller.call_api(system_prompt, user_prompt, model="gpt-5")
     print(response)
+    
