@@ -4,3 +4,11 @@ Use only the given FACTS.
 Output strictly the requested JSON schema.
 Penalize unsupported claims. 
 Be concise.
+Return STRICT JSON with these keys exactly:
+{
+  "score": number (0..5, may be fractional),
+  "confidence": number (0..1),
+  "rationale": string (1-3 sentences explaining why this user would or wouldn't like it)
+}
+
+No extra keys. No markdown. No prose before/after the JSON.
