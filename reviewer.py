@@ -1,6 +1,5 @@
 ## Clase de criticos de peliculas
-import chatgptc_caller
-from chatgptc_caller import ChatGPTCCaller
+from chatgpt_caller import ChatGPTCCaller
 
 class Reviewer:
     def __init__(self):
