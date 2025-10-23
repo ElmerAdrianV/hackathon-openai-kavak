@@ -1,4 +1,3 @@
-````markdown
 # 🎬 Agentic Movie Recommender — Self-Improving Multi-Agent System
 
 **Un sistema de recomendación de películas que aprende y se auto-mejora usando agentes de IA que debaten, juzgan y se optimizan continuamente.**
@@ -667,13 +666,6 @@ userId,movieId,rating,title,overview,genres,genre_list,personality
 
 **Proyecto**: Hackathon OpenAI x Kavak  
 **Repositorio**: [github.com/ElmerAdrianV/hackathon-openai-kavak](https://github.com/ElmerAdrianV/hackathon-openai-kavak)
-
----
-
-## 📜 Licencia
-
-MIT License - Ver [LICENSE](LICENSE) para detalles
-
 ---
 
 ## 🙏 Agradecimientos
@@ -690,4 +682,4 @@ MIT License - Ver [LICENSE](LICENSE) para detalles
 python -m src.main_demo --samples 20 --review-interval 5
 ```
 
-````
+
