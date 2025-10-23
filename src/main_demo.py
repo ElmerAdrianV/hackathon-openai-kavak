@@ -72,12 +72,12 @@ def load_default_df() -> pd.DataFrame:
     """
     Load default dataset from src/data/ directory relative to this script.
     Tries multiple file patterns in order of preference.
+    
+    Returns the train dataframe for backward compatibility with single-df mode.
     """
     here = Path(__file__).resolve().parent  # src/ directory
     cand = [
-        here / "data" / "user_1_data.csv",
-        here / "data" / "movie_user_data.pkl",
-        here / "data" / "movie_user_data.csv",
+        here / "data" / "splits" / "train_users_1.csv"
     ]
     for p in cand:
         if p.exists():
@@ -85,8 +85,34 @@ def load_default_df() -> pd.DataFrame:
             return load_df_from_path(str(p))
     raise FileNotFoundError(
         "No default dataset found. Provide a path argument or place a file at:\n"
-        "  src/data/user_1_data.csv, src/data/movie_user_data.pkl, or src/data/movie_user_data.csv"
+        "  src/data/splits/train_users_1.csv, src/data/user_1_data.csv, \n"
+        "  src/data/movie_user_data.pkl, or src/data/movie_user_data.csv"
     )
+
+
+def load_train_test_split() -> tuple[pd.DataFrame, pd.DataFrame | None]:
+    """
+    Load train/test split if available, otherwise return (train, None).
+    Looks for:
+      - src/data/splits/train_users_1.csv + test_users_1.csv
+      - Falls back to single dataset as train-only
+    """
+    here = Path(__file__).resolve().parent
+    train_path = here / "data" / "splits" / "train_users_1.csv"
+    test_path = here / "data" / "splits" / "test_users_1.csv"
+    
+    if train_path.exists() and test_path.exists():
+        print(f"[Init] Loading train/test split:")
+        print(f"  Train: {train_path}")
+        print(f"  Test:  {test_path}")
+        train_df = load_df_from_path(str(train_path))
+        test_df = load_df_from_path(str(test_path))
+        return train_df, test_df
+    
+    # Fallback: single dataset as train
+    print("[Init] No train/test split found, using default dataset as train-only")
+    train_df = load_default_df()
+    return train_df, None
 
 
 # ---------------- discovery helpers ----------------
@@ -243,7 +269,11 @@ def debug_list_dir(path: Path, label: str):
         print(f"[Debug] Could not list {label}: {e}")
 
 
-def build_system(df: pd.DataFrame, resources_dir: str | None = None) -> Orchestrator:
+def build_system(
+    train_df: pd.DataFrame,
+    test_df: pd.DataFrame | None = None,
+    resources_dir: str | None = None,
+) -> Orchestrator:
     resources_path = resolve_resources_dir(resources_dir)
     print(f"[Init] resources_dir resolved to: {resources_path}")
 
@@ -290,35 +320,48 @@ def build_system(df: pd.DataFrame, resources_dir: str | None = None) -> Orchestr
 
     cfg = OrchestratorConfig(
         resources_dir=str(resources_path),
-        k_critics=min(4, len(critics)),
+        k_critics=min(2, len(critics)),
         k_judges=1,
         calibrator_dim=8,
     )
 
-    store = DataStore(df)
+    # Build DataStore with train/test split
+    store = DataStore(train_df, test_df)
     retriever = Retriever(store)
     return Orchestrator(critics, judges, retriever, cfg)
 
 
 # ---------------- demo flow ----------------
-def demo_flow(path_to_data: str | None = None, resources_dir: str | None = None):
-    if path_to_data:
-        df = load_df_from_path(path_to_data)
+def demo_flow( resources_dir: str | None = None):
+    """
+    Demo flow with train/test split support.
+    
+    If path_to_data is provided, it's used as train data (single file mode).
+    Otherwise, attempts to load train/test split from src/data/splits/
+    
+    Evaluation is done on test set if available, otherwise on train (for demo purposes).
+    """
+
+    # Try to load train/test split
+    train_df, test_df = load_train_test_split()
+    eval_df = test_df if test_df is not None else train_df
+    if test_df is not None:
+        print("[Demo] Train/Test split loaded: evaluating on test set (no contamination)")
     else:
-        df = load_default_df()
+        print("[Demo] No test set: evaluating on train data (demo mode)")
 
-    orch = build_system(df, resources_dir=resources_dir)
+    orch = build_system(train_df, test_df, resources_dir=resources_dir)
 
-    if len(df) == 0:
-        print("Dataset is empty.")
+    if len(eval_df) == 0:
+        print("Evaluation dataset is empty.")
         return
 
-    # ---- First example ----
-    row = df.iloc[0]
+    # ---- First example from eval set ----
+    row = eval_df.iloc[0]
     u = str(row["userId"])
     m = str(row["movieId"])
     print(
-        f"\n[Demo] Using row 0: userId={u}, movieId={m}, title={row.get('title', '')}"
+        f"\n[Demo] Evaluating row 0: userId={u}, movieId={m}, title={row.get('title', '')}"
     )
 
     yhat, sigma, aux = orch.predict(user_id=u, movie_id=m)
@@ -327,16 +370,17 @@ def demo_flow(path_to_data: str | None = None, resources_dir: str | None = None)
         print_verbose_from_last_log(orch, "  --- Verbose details (after Predict 1) ---")
 
     true_rating = float(row.get("rating", 3.0))
+    print(f"[Ground Truth] true_rating={true_rating:.2f}")
     orch.online_update(true_rating=true_rating)
     print(f"[Update] online_update with true_rating={true_rating:.2f}")
 
-    # ---- Second example ----
-    idx2 = 1 if len(df) > 1 else 0
-    row2 = df.iloc[idx2]
+    # ---- Second example from eval set ----
+    idx2 = 1 if len(eval_df) > 1 else 0
+    row2 = eval_df.iloc[idx2]
     u2 = str(row2["userId"])
     m2 = str(row2["movieId"])
     print(
-        f"\n[Demo] Using row {idx2}: userId={u2}, movieId={m2}, title={row2.get('title', '')}"
+        f"\n[Demo] Evaluating row {idx2}: userId={u2}, movieId={m2}, title={row2.get('title', '')}"
     )
 
     yhat2, sigma2, aux2 = orch.predict(user_id=u2, movie_id=m2)
@@ -345,6 +389,7 @@ def demo_flow(path_to_data: str | None = None, resources_dir: str | None = None)
         print_verbose_from_last_log(orch, "  --- Verbose details (after Predict 2) ---")
 
     true_rating2 = float(row2.get("rating", 3.0))
+    print(f"[Ground Truth] true_rating={true_rating2:.2f}")
     orch.online_update(true_rating=true_rating2)
     print(f"[Update] online_update with true_rating={true_rating2:.2f}\n")
 
@@ -367,4 +412,4 @@ if __name__ == "__main__":
             data_arg = args[2] if len(args) > 2 else None
         else:
             data_arg = args[0]
-    demo_flow(data_arg, resources_dir=res_arg)
+    demo_flow(resources_dir=res_arg)

@@ -1,5 +1,4 @@
 from __future__ import annotations
-from typing import Optional
 from .types import ContextPack
 from .data_store import DataStore
 

@@ -125,9 +125,7 @@ class Judge:
         raw = self.llm.generate(
             system_prompt=system_prompt,
             user_prompt=user_prompt,
-            model=self.model,
-            settings={"max_completion_tokens": 350},
-            force_json=True,
+            model=self.model
         )
 
         data: Dict[str, Any] = extract_json_block(raw) or {}
