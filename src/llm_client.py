@@ -1,4 +1,6 @@
 import os
+import json
+import re
 from dotenv import load_dotenv
 from openai import OpenAI
 from typing import Optional, Dict, List
@@ -62,11 +64,25 @@ class LLMClient:
                 return str(response)
 
 
-if __name__ == "__main__":
-    caller = LLMClient()
-
-    system_prompt = "You are a helpful assistant."
-    user_prompt = "Hello, how can you assist me today?"
-    response = caller.generate(system_prompt, user_prompt, model="gpt-5")
-    print(response)
-    
+def extract_json_block(text: str) -> Dict:
+    """
+    Best-effort helper used by critics/judges to parse STRICT JSON responses.
+    - First tries full-string JSON.
+    - Then searches the first {...} block and parses that.
+    - Returns {} on failure.
+    """
+    if not text:
+        return {}
+    # direct parse
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+    # find a JSON object block
+    m = re.search(r"\{[\s\S]*\}", text)
+    if m:
+        try:
+            return json.loads(m.group(0))
+        except Exception:
+            pass
+    return {}

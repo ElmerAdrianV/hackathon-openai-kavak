@@ -3,6 +3,7 @@ from typing import Dict, Any, List
 import os, json
 from .types import EventLog, now_ts
 
+
 class EventLogger:
     def __init__(self, base_dir: str = "./logs"):
         self.base_dir = base_dir

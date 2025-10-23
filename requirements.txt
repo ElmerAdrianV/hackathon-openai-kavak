@@ -1,5 +1,4 @@
-# Requirements for hackathon-openai-kavak
-# Minimum dependencies
-openai>=1.0.0
-python-dotenv>=0.21.0
-
+openai>=1.40.0
+python-dotenv>=1.0.1
+numpy>=1.23
+pandas>=1.5
