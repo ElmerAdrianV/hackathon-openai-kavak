@@ -1,44 +1,53 @@
 from __future__ import annotations
-from typing import Dict, Any
+from typing import Optional
 from .types import ContextPack
+from .data_store import DataStore
 
 
-def retrieve_context(user_id: str, movie_id: str) -> ContextPack:
-    # TODO: replace with real store/embeddings/metadata
-    user_profile = {
-        "history": [
-            {
-                "movie_id": "m101",
-                "title": "Indie Love",
-                "rating": 4.5,
-                "genres": ["Drama", "Romance"],
-            },
-            {
-                "movie_id": "m205",
-                "title": "Action Max",
-                "rating": 2.0,
-                "genres": ["Action"],
-            },
-        ]
-    }
-    movie_profile = {
-        "title": f"Movie {movie_id}",
-        "year": 2021,
-        "genres": ["Drama"],
-        "cast": ["A. Actor", "B. Star"],
-    }
-    genre = movie_profile["genres"][0] if movie_profile.get("genres") else "Unknown"
-    retrieved = {
-        "neighbors": [
-            {"movie_id": "m101", "sim": 0.78, "title": "Indie Love"},
-            {"movie_id": "m333", "sim": 0.64, "title": "Quiet Evenings"},
-        ]
-    }
-    return ContextPack(
-        user_id=user_id,
-        movie_id=movie_id,
-        genre=genre,
-        user_profile=user_profile,
-        movie_profile=movie_profile,
-        retrieved=retrieved,
-    )
+class Retriever:
+    """
+    Real retriever backed by a DataStore.
+    """
+
+    def __init__(self, store: DataStore):
+        self.store = store
+
+    def get_context(
+        self,
+        user_id: str,
+        movie_id: str,
+        k_history: int = 10,
+        k_neighbors: int = 8,
+    ) -> ContextPack:
+        movie = self.store.get_movie(movie_id)
+        if not movie:
+            movie = {"title": f"Movie {movie_id}", "overview": "", "genre_list": []}
+
+        # Primary genre for quick routing feature
+        genre = movie.get("genre_list", [])
+        primary_genre = genre[0] if genre else "Unknown"
+
+        user_hist = self.store.get_user_history(user_id, k=k_history)
+        personality = self.store.get_user_personality(user_id)
+
+        neighbors = self.store.get_neighbors(movie_id, k=k_neighbors)
+
+        user_profile = {
+            "history": user_hist,
+            "personality": personality,
+        }
+        movie_profile = {
+            "title": movie.get("title", ""),
+            "overview": movie.get("overview", ""),
+            "genres": movie.get("genre_list", []),
+        }
+        retrieved = {"neighbors": neighbors}
+
+        return ContextPack(
+            user_id=str(user_id),
+            movie_id=str(movie_id),
+            genre=primary_genre,
+            user_profile=user_profile,
+            movie_profile=movie_profile,
+            retrieved=retrieved,
+        )

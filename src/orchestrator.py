@@ -7,17 +7,17 @@ from .critics import CriticManager, Critic
 from .judges import JudgePool, Judge
 from .calibrator import OnlineCalibrator
 from .router import Router
-from .retriever import retrieve_context
 from .features import featurize
 from .logging_store import EventLogger
+from .retriever import Retriever
 
 
 @dataclass
 class OrchestratorConfig:
-    resources_dir: str = "./resources"  # expects /movie_critics and /judges
+    resources_dir: str = "./resources"
     k_critics: int = 4
     k_judges: int = 1
-    calibrator_dim: int = 8  # must match features.featurize output size
+    calibrator_dim: int = 8
     lr: float = 1e-2
     l2: float = 1e-4
 
@@ -27,6 +27,7 @@ class Orchestrator:
         self,
         critics: List[Critic],
         judges: List[Judge],
+        retriever: Retriever,
         cfg: OrchestratorConfig = OrchestratorConfig(),
     ):
         self.cfg = cfg
@@ -40,13 +41,13 @@ class Orchestrator:
         )
         self.calibrator = OnlineCalibrator(dim=cfg.calibrator_dim, lr=cfg.lr, l2=cfg.l2)
         self.logger = EventLogger()
-        # simple running critic "track record" usable by judges (MVP all zeros)
+        self.retriever = retriever
         self.critic_track: Dict[str, float] = {c.critic_id: 0.0 for c in critics}
 
     def predict(
         self, user_id: str, movie_id: str
     ) -> Tuple[float, float, Dict[str, Any]]:
-        ctx = retrieve_context(user_id, movie_id)
+        ctx = self.retriever.get_context(user_id, movie_id)
         judge_skill = self.judges.get_skill_table()
         chosen_critics, chosen_judges = self.router.select(ctx.genre, judge_skill)
 
@@ -64,7 +65,11 @@ class Orchestrator:
             ts=now_ts(),
             user_id=user_id,
             movie_id=movie_id,
-            context={"genre": ctx.genre, "movie_profile": ctx.movie_profile},
+            context={
+                "genre": ctx.genre,
+                "movie_profile": ctx.movie_profile,
+                "user_personality": ctx.user_profile.get("personality", ""),
+            },
             critic_outputs=[c.__dict__ for c in critic_outs],
             judge_outputs=[j.__dict__ for j in judge_outs],
             yhat=yhat,
@@ -77,27 +82,24 @@ class Orchestrator:
             "chosen_critics": chosen_critics,
             "chosen_judges": chosen_judges,
             "disagreement": disagreement,
+            "user_personality": ctx.user_profile.get("personality", ""),
         }
         return yhat, sigma, aux
 
     def online_update(self, true_rating: float):
-        """
-        Update calibrator and judge skills using the last logged event (MVP).
-        In production, you'd join feedback by (user, movie, ts).
-        """
         events = self.logger.read_all()
         if not events:
             return
         last = events[-1]
 
-        # Reconstruct lightweight objects for featurization
+        # Rebuild light objects to featurize (we skip full retrieval here)
         ctx = ContextPack(
             user_id=last["user_id"],
             movie_id=last["movie_id"],
             genre=last["context"]["genre"],
-            user_profile={},
-            movie_profile={},
-            retrieved={},
+            user_profile={"personality": last["context"].get("user_personality", "")},
+            movie_profile=last["context"]["movie_profile"],
+            retrieved={"neighbors": []},
         )
         critics = [CriticOutput(**co) for co in last["critic_outputs"]]
         judges = [JudgeOutput(**jo) for jo in last["judge_outputs"]]
@@ -106,14 +108,11 @@ class Orchestrator:
         x, _ = featurize(critics, judges, ctx, judge_skill)
         self.calibrator.partial_fit(x, true_rating)
 
-        # Update judge skills (EMA negative MSE)
         for jo in judges:
             for j in self.judges.judges:
                 if j.judge_id == jo.judge_id:
                     j.update_skill(true_rating, jo.r_tilde)
 
-        # (Optional) update simple critic track record from residuals
-        # Here: critics closer to true_rating get a small bump
         for co in critics:
             err = abs(true_rating - co.score)
             self.critic_track[co.critic_id] = 0.9 * self.critic_track.get(
@@ -121,7 +120,4 @@ class Orchestrator:
             ) + 0.1 * (-err)
 
     def nightly_evolution(self):
-        """
-        Placeholder: mutate low-skill judge/critic prompts using offline replay.
-        """
         pass
